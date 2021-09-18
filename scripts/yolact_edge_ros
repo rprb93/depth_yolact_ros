@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 import roslib
 roslib.load_manifest('yolact_ros')
 import sys
@@ -79,7 +79,7 @@ class YolactNode:
     self.net = net
 
     self.image_pub = rospy.Publisher("~visualization", Image, queue_size=1)
-
+  
     self.detections_pub = rospy.Publisher("~detections", Detections, queue_size=1)
 
     self.bridge = CvBridge()
@@ -444,7 +444,6 @@ def main(args):
       net = net.cuda()
       net.detect.use_fast_nms = True
       cfg.mask_proto_debug = False
-
   ic = YolactNode(net)
   
   srv = ReconfigureServer(YolactConfig, ic.reconfigure_callback)

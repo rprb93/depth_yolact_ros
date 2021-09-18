@@ -1,43 +1,56 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
+
+from numpy.lib.nanfunctions import _nan_mask
 import roslib
 roslib.load_manifest('yolact_ros')
-import sys
+
 import os
+import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), "yolact"))
-import rospy
-import rospkg
+
 import cv2
 import threading
-from queue import Queue
-from std_msgs.msg import String
-from std_msgs.msg import Header
-from sensor_msgs.msg import Image
-from sensor_msgs.msg import CompressedImage
-from yolact_ros_msgs.msg import Detections
-from yolact_ros_msgs.msg import Detection
-from yolact_ros_msgs.msg import Box
-from yolact_ros_msgs.msg import Mask
+import numpy as np
 
-from yolact_ros_msgs import mask_utils
+import torch
+import torch.backends.cudnn as cudnn
+
+from torch_kmeans import KMeans
+from scipy.stats import norm
+
+import rospy
+import rospkg
+import message_filters
+
+import tf2_ros
+import tf2_geometry_msgs  
+from tf.transformations import  translation_matrix, quaternion_matrix, concatenate_matrices
+from std_msgs.msg import Header
+
+from geometry_msgs.msg import PointStamped,  PoseArray, Pose
+from sensor_msgs import point_cloud2
+from sensor_msgs.msg import PointCloud2, PointField
+from sensor_msgs.msg import Image, CameraInfo, CompressedImage
+from visualization_msgs.msg import MarkerArray, Marker
 
 from cv_bridge import CvBridge, CvBridgeError
 
-import numpy as np
-import torch
-import torch.backends.cudnn as cudnn
-from torch.autograd import Variable
+
 from yolact import Yolact
-from utils.augmentations import BaseTransform, FastBaseTransform, Resize
-from layers.output_utils import postprocess, undo_image_transformation
-from data import COCODetection, get_label_map, MEANS, COLORS
-from data import cfg, set_cfg, set_dataset
+from utils.augmentations import FastBaseTransform
+from layers.output_utils import postprocess
+from data import  COLORS
+from data import cfg, set_cfg
 from utils import timer
 from utils.functions import SavePath
-from collections import defaultdict
-from rospy.numpy_msg import numpy_msg
 
-from dynamic_reconfigure.server import Server as ReconfigureServer
+from yolact_ros_msgs.msg import Detections, Detection
+
 from yolact_ros.cfg import YolactConfig
+from dynamic_reconfigure.server import Server as ReconfigureServer
+
+from collections import defaultdict
+
 
 iou_thresholds = [x / 100 for x in range(50, 100, 5)]
 coco_cats = {} # Call prep_coco_cats to fill this
@@ -71,33 +84,51 @@ class SynchronizedObject:
     self.co.release()
     return obj
 
-class YolactNode:
 
+class YolactNode:
+  """
+  YOLACT ROS node class
+
+  The functions postprocess_results and prep_display are slightly modified versions
+  of the prep_display function in yolact's eval.py; Copyright (c) 2019 Daniel Bolya
+  """
   def __init__(self, net:Yolact):
+    self.first_data_call = True
+
     self.net = net
 
-    self.image_pub = rospy.Publisher("~visualization", Image, queue_size=1)
+    self.kmeans = KMeans(2)
 
-    self.detections_pub = rospy.Publisher("~detections", Detections, queue_size=1)
+    self.image_pub = rospy.Publisher("~visualization", Image, queue_size=10)
+    self.detections_pub = rospy.Publisher("~detections", Detections, queue_size=10)
+    self.bboxes_pub = rospy.Publisher("~bboxes", MarkerArray, queue_size=10)
+    self.pcl_pub = rospy.Publisher("~pointcloud",PointCloud2, queue_size=20)
+
+    self.pose_pub = rospy.Publisher("~pose", PoseArray, queue_size=5)
+
+    self.tf_buffer = tf2_ros.Buffer()
+    listener = tf2_ros.TransformListener(self.tf_buffer)
 
     self.bridge = CvBridge()
 
-    self.processing_queue = SynchronizedObject()
+    self.image_processing_queue = SynchronizedObject()
+    self.depth_processing_queue = SynchronizedObject()
+
     self.processing_thread = threading.Thread(target=self.processingLoop)
     self.processing_thread.daemon = True
     self.processing_thread.start()
-
-    self.image_vis_queue = SynchronizedObject()
-    self.visualization_thread = None
-    self.unpause_visualization = threading.Event()
 
     # set parameter default values (will be overwritten by dynamic reconfigure callback)
 
     self.image_topic = ''
     self.use_compressed_image = False
+    self.use_compressed_depth = False
     self.publish_visualization = True
-    self.publish_detections = True
-    self.display_visualization = False
+
+    #TODO: use this to publish the detections and subscribe to it in a C++ node and do all the work there (gonna be faster for the filtration and pcl)
+    self.publish_detections = False
+    self.publish_pointcloud = False
+    self.publish_bboxes = False
 
     self.display_masks = True
     self.display_bboxes = True
@@ -109,44 +140,70 @@ class YolactNode:
     self.top_k = 5
 
     self.image_sub = None # subscriber is created in dynamic_reconfigure callback
+    self.depth_sub = None
+
+    # the initial centroid for clustering, set in dynamic_recofigure callback
+    self.initial_centroid = 0
+    self.use_kmeans = True
+    self.use_bboxes_world_frame = True
+    self.world_frame = None
+    
+    self.use_gaussian = True
+    self.std_multiplier = 1.0
 
     # for counting fps
     self.fps = 0
     self.last_reset_time = rospy.Time()
     self.frame_counter = 0
 
-  def visualizationLoop(self):
-      print('Creating cv2 window')
-      window_name = 'Segmentation results'
-      cv2.namedWindow(window_name)
-      print('Window successfully created')
-      while True:
-        if not self.unpause_visualization.is_set():
-            print('Pausing visualization')
-            cv2.destroyWindow(window_name)
-            cv2.waitKey(30)
-            self.unpause_visualization.wait()
-            print('Unpausing visualization')
-            cv2.namedWindow(window_name)
+    self.boxes_list = []
+    self.boxes_poses_list = []
 
-        image = self.image_vis_queue.get_nowait()
-        if image is None:
-            cv2.waitKey(30)
-            continue
-
-        cv2.imshow(window_name, image)
-        cv2.waitKey(30)
 
   def processingLoop(self):
       while True:
-        cv_image, image_header = self.processing_queue.get()
-        self.evalimage(cv_image, image_header)
+        cv_image, image_header = self.image_processing_queue.get()
+        depth_cv_image, depth_header = self.depth_processing_queue.get()
+        self.evalimage(cv_image, image_header, depth_cv_image, depth_header)
 
 
-  """
-  The functions postprocess_results and prep_display are slightly modified versions
-  of the prep_display function in yolact's eval.py; Copyright (c) 2019 Daniel Bolya
-  """
+  def transform_pcl(self, xs, ys, zs, target_frame, source_frame):
+    transform = self.tf_buffer.lookup_transform(target_frame,source_frame,rospy.Time(0),rospy.Duration(0.5))
+    mat1 = translation_matrix([transform.transform.translation.x,transform.transform.translation.y,transform.transform.translation.z])
+    mat2 = quaternion_matrix([transform.transform.rotation.x,transform.transform.rotation.y,transform.transform.rotation.z,transform.transform.rotation.w])
+    matrix = concatenate_matrices(mat1, mat2)
+    points = np.dot(matrix,np.c_[xs,ys,zs,np.ones_like(xs)].T)
+    return points[0,:].tolist(), points[1,:].tolist(), points[2,:].tolist()
+
+
+  def transform_point(self, point:PointStamped, from_frame:str, to_frame:str):      
+      point_stamped = tf2_geometry_msgs.PointStamped()
+      point_stamped.point = point.point
+      point_stamped.header = point.header
+      transform = self.tf_buffer.lookup_transform(to_frame,from_frame,rospy.Time(0),rospy.Duration(0.5))
+      return tf2_geometry_msgs.do_transform_point(point_stamped,transform).point
+
+
+  def transform_point_list(self, points:list, from_frame:str, to_frame:str):      
+      transform = self.tf_buffer.lookup_transform(to_frame,from_frame,rospy.Time(0),rospy.Duration(0.5))
+      transformed_points = []
+      for point in points:
+        point_stamped = tf2_geometry_msgs.PointStamped()
+        point_stamped.point = point.point
+        point_stamped.header = point.header
+        transformed_points.append(tf2_geometry_msgs.do_transform_point(point_stamped,transform).point)
+      return transformed_points
+
+  def transform_pose_list(self, poses, pose_header, to_frame):      
+      transform = self.tf_buffer.lookup_transform(to_frame, pose_header.frame_id, rospy.Time(0), rospy.Duration(0.5))
+      transformed_poses = []
+      for pose in poses:
+        pose_stamped = tf2_geometry_msgs.PoseStamped()
+        pose_stamped.pose = pose
+        pose_stamped.header = pose_header
+        transformed_poses.append(tf2_geometry_msgs.do_transform_pose(pose_stamped,transform).pose)
+      return transformed_poses
+
 
   def postprocess_results(self, dets_out, w, h):
       with timer.env('Postprocess'):
@@ -243,7 +300,7 @@ class YolactNode:
           cv2.putText(img_numpy, fps_str, text_pt, font_face, font_scale, text_color, font_thickness, cv2.LINE_AA)
 
       if num_dets_to_consider == 0:
-          return img_numpy
+        return img_numpy
 
       if self.display_text or self.display_bboxes:
           for j in reversed(range(num_dets_to_consider)):
@@ -270,8 +327,8 @@ class YolactNode:
                   cv2.rectangle(img_numpy, (x1, y1), (x1 + text_w, y1 - text_h - 4), color, -1)
                   cv2.putText(img_numpy, text_str, text_pt, font_face, font_scale, text_color, font_thickness, cv2.LINE_AA)
 
-
       return img_numpy
+
 
   def generate_detections_msg(self, classes, scores, boxes, masks, image_header):
     dets_msg = Detections()
@@ -290,19 +347,186 @@ class YolactNode:
       det.mask.width = int(x2 - x1)
       dets_msg.detections.append(det)
 
-      #encoding_correct = True
-      #for x in range(det.mask.width):
+      # encoding_correct = True
+      # for x in range(det.mask.width):
       #    for y in range(det.mask.height):
       #        if bool(masks[detnum,y1+y,x1+x]) != mask_utils.test(det.mask, x, y):
       #            encoding_correct = False
-      #print('Encoding correct: ' + str(encoding_correct))
+      # print('Encoding correct: ' + str(encoding_correct))
 
     dets_msg.header = image_header
     return dets_msg
 
-  def evalimage(self, cv_image, image_header):
+
+  def coorddepth2xy(self,x,y,depth):
+    return depth*((x-self.cx)*(self.inv_fx)) , depth*((y-self.cy)*(self.inv_fy)) 
+
+
+  def depth2pcl(self,box,depth):
+    x1,y1,x2,y2 = box
+    x_pos, y_pos = [i.flatten() for i  in np.meshgrid(range(x1,x2),range(y1,y2))]
+    zs = depth[y1:y2,x1:x2].flatten()
+    return zs*((x_pos-self.cx)*(self.inv_fx)),  zs*((y_pos-self.cy)*(self.inv_fy)), zs
+
+
+  def zs2xy(self,box,zs):
+    x1,y1,x2,y2 = box
+    x_pos, y_pos = [i.flatten() for i  in np.meshgrid(range(x1,x2),range(y1,y2))]
+    return zs*((x_pos-self.cx)*(self.inv_fx)),  zs*((y_pos-self.cy)*(self.inv_fy))
+
+
+  def depth2pcl_torch(self,box,depth):
+    x1,y1,x2,y2 = box
+    x_pos, y_pos = [i.flatten() for i  in torch.meshgrid(torch.arange(y1,y2),torch.arange(x1,x2))]
+    zs = depth[y1:y2,x1:x2].flatten()
+    return zs*((x_pos-self.cx)*(self.inv_fx)),  zs*((y_pos-self.cy)*(self.inv_fy)), zs
+
+
+  def thread_func(self,box,depth_image,mask,header,id):          
+    # if the detection mask is already empty return because it's all useless now
+    if torch.all(mask==0) or torch.all(torch.isnan(mask)):
+      rospy.logerr("the received detection mask is all zeros. Dropping the frame")
+      return
+
+    x1,y1,x2,y2 = box
+    if self.use_kmeans:
+      # clustering the depth points masked with the segmentation mask 
+      # this is to remove far outliers that appears due to mask misalignment with the actual object which crops points from the background
+      points = depth_image[mask>0]
+      # this arrangement will make the label of the actual body 1 and the incorrect points 0
+      centroids = torch.tensor([[self.initial_centroid],[depth_image[int((y1+y2)/2),int((x1+x2)/2)]]],dtype=torch.float32)
+      labels = self.kmeans.fit_predict(points[:,None],centroids ) 
+      mask[mask>0] *= labels
+
+    mask = mask.bool().cpu().numpy()
+    depth_image = depth_image.float().cpu().numpy()
+
+    zs = depth_image[y1:y2,x1:x2].flatten()
+    flat_mask_cropped = mask[y1:y2,x1:x2].flatten()
+    zero_mask = np.where(zs==0,False,True)
+    nan_mask = np.where(np.isnan(zs),False,True)
+    nan_zero_detection_mask = np.logical_and(flat_mask_cropped,np.logical_and(zero_mask,nan_mask))
+
+    #return before pushing any message
+    #TODO: check them all then return if any is triggered
+    if np.all(nan_mask==False):
+      rospy.logwarn("Depth image has all nan values. Dropping the object from this frame")
+      return 
+    elif np.all(zero_mask==False):
+      rospy.logwarn("Depth image has all zero values. Dropping the object from this frame")
+      return
+    elif np.all(flat_mask_cropped==False):
+      rospy.logwarn("The detection mask became all zeros after filteration. Dropping the object from this frame")
+      return
+    elif np.all(nan_zero_detection_mask==False): #maybe the whole combination is a false
+      rospy.logwarn("A combination of zeros and nan values are covering the whole mask area. Dropping the object from this frame.")
+      return
+
+    # generating the x y coord and applying the masks to the cropped depth points
+    x_pos, y_pos = [i.flatten() for i  in np.meshgrid(range(x1,x2),range(y1,y2))]
+    x_pos = x_pos[nan_zero_detection_mask]
+    y_pos = y_pos[nan_zero_detection_mask]
+    zs    = zs[nan_zero_detection_mask]
+
+    if self.use_gaussian:
+      mu, std = norm.fit(zs)
+      outliers_mask = np.abs(zs-mu)<self.std_multiplier*std
+      x_pos = x_pos[outliers_mask]
+      y_pos = y_pos[outliers_mask]
+      zs    = zs[outliers_mask]
+
+    # getting the actual measures of each point of the masked cloud. zs are the same so no need to convert them
+    xs,ys = self.coorddepth2xy(x_pos,y_pos,zs)
+    self.pcl_xs.extend(xs.tolist())
+    self.pcl_ys.extend(ys.tolist())
+    self.pcl_zs.extend(zs.tolist())
+
+    # TODO: convert all odom words to world
+    bbox = Marker()
+    if self.use_bboxes_world_frame:
+        xs_odom, ys_odom, zs_odom = self.transform_pcl(xs, ys, zs, self.world_frame, header.frame_id)
+        x_min, x_max = np.min(xs_odom), np.max(xs_odom) 
+        y_min, y_max = np.min(ys_odom), np.max(ys_odom) 
+        z_min, z_max = np.min(zs_odom), np.max(zs_odom) 
+        x_mid, y_mid, z_mid = (x_min+x_max)/2, (y_min+y_max)/2, (z_min+z_max)/2
+        min_pose = Pose()
+        min_pose.position.x = x_min
+        min_pose.position.y = y_min
+        min_pose.position.z = z_min
+        min_pose.orientation.w = 1
+        self.boxes_poses_list.append(min_pose)
+        mid_pose = Pose()
+        mid_pose.position.x = x_mid
+        mid_pose.position.y = y_mid
+        mid_pose.position.z = z_mid
+        mid_pose.orientation.w = 1
+        self.boxes_poses_list.append(mid_pose)
+        max_pose = Pose()
+        max_pose.position.x = x_max
+        max_pose.position.y = y_max
+        max_pose.position.z = z_max
+        max_pose.orientation.w = 1
+        self.boxes_poses_list.append(max_pose)
+
+        bbox.header.seq = header.seq
+        bbox.header.stamp = header.stamp
+        bbox.header.frame_id = self.world_frame
+
+        bbox.pose = mid_pose
+
+        bbox.scale.x = x_max - x_min
+        bbox.scale.y = y_max - y_min
+        bbox.scale.z = z_max - z_min
+
+    else:
+        x_min, x_max = np.min(xs), np.max(xs) 
+        y_min, y_max = np.min(ys), np.max(ys) 
+        z_min, z_max = np.min(zs), np.max(zs) 
+        x_mid, y_mid, z_mid = (x_min+x_max)/2, (y_min+y_max)/2, (z_min+z_max)/2
+
+        min_pose = Pose()
+        min_pose.position.x = x_min
+        min_pose.position.y = y_min
+        min_pose.position.z = z_min
+        min_pose.orientation.w = 1
+        self.boxes_poses_list.append(min_pose)
+        mid_pose = Pose()
+        mid_pose.position.x = x_mid
+        mid_pose.position.y = y_mid
+        mid_pose.position.z = z_mid
+        mid_pose.orientation.w = 1
+        self.boxes_poses_list.append(mid_pose)
+        max_pose = Pose()
+        max_pose.position.x = x_max
+        max_pose.position.y = y_max
+        max_pose.position.z = z_max
+        max_pose.orientation.w = 1
+        self.boxes_poses_list.append(max_pose)
+
+        bbox.header = header
+
+        bbox.pose = mid_pose
+
+        bbox.scale.x = x_max - x_min
+        bbox.scale.y = y_max - y_min
+        bbox.scale.z = z_max - z_min
+
+
+    bbox.type = 1
+    bbox.id = id
+    bbox.color.a=0.25
+    bbox.color.g=1.00
+    bbox.lifetime = rospy.Duration(0.25)
+
+    self.boxes_list.append(bbox)       
+
+
+  def evalimage(self, cv_image, image_header, depth_image_cv, depth_header):
+    #Note to self: I use logwarn to log data smoetimes because it can be easily seen in the terminal not becuase there's a warning actually
+
     with torch.no_grad():
       frame = torch.from_numpy(cv_image).cuda().float()
+      depth_image = torch.from_numpy(depth_image_cv).cuda().float()
       batch = FastBaseTransform()(frame.unsqueeze(0))
       preds = self.net(batch)
 
@@ -317,66 +541,150 @@ class YolactNode:
           self.frame_counter = 0
         self.frame_counter += 1
 
-      if self.publish_visualization or self.display_visualization:
-        image = self.prep_display(classes, scores, boxes, masks, frame, fps_str=str(self.fps))
+      threads = []
+      self.boxes_list = []
+      self.boxes_poses_list = []
+      self.pcl_xs,self.pcl_ys,self.pcl_zs = [], [], []
+      bboxes = MarkerArray()
+      poses =  PoseArray()
+      if classes.shape[0]==0 or not(self.publish_bboxes or self.publish_pointcloud):
+        #for the no detection cases
+        pass    #fill the nans with nearest neightbour...better than nothing
 
+      else:
+        num_dets_to_consider = min(self.top_k, classes.shape[0])
+        masks_top = (255*masks[:num_dets_to_consider, :, :])
+        for detnum in range(len(classes)):
+          mask = masks_top[detnum]
+          box = boxes[detnum]
+
+          x = threading.Thread(target=self.thread_func, args=(box,depth_image,mask,depth_header,detnum))
+          threads.append(x)
+          x.start()
+      for thread in threads:
+          thread.join()
+
+
+      if self.publish_pointcloud:
+        pcl_points = np.c_[self.pcl_xs,self.pcl_ys,self.pcl_zs]
+        fields = [PointField('x', 0, PointField.FLOAT32, 1),
+                  PointField('y', 4, PointField.FLOAT32, 1),
+                  PointField('z', 8, PointField.FLOAT32, 1),
+                  ]
+        pc2 = point_cloud2.create_cloud(depth_header, fields, pcl_points)
+        self.pcl_pub.publish(pc2)
+
+      if self.publish_bboxes:
+        bboxes.markers = self.boxes_list
+        if len(self.boxes_list)==0:
+          temp = Marker()
+          temp.action = Marker.DELETEALL
+          bboxes.markers.append(temp)
+        self.bboxes_pub.publish(bboxes)
+        if self.use_bboxes_world_frame:
+          poses.header.seq = depth_header.seq
+          poses.header.stamp = depth_header.stamp
+          poses.header.frame_id = self.world_frame 
+        else: 
+          poses.header = depth_header
+        poses.poses = self.boxes_poses_list
+        self.pose_pub.publish(poses)
+      
       if self.publish_detections:
         dets = self.generate_detections_msg(classes, scores, boxes, masks, image_header)
         self.detections_pub.publish(dets)
 
-      if self.display_visualization:
-        self.image_vis_queue.put_nowait(image)
-
       if self.publish_visualization:
+        image = self.prep_display(classes, scores, boxes, masks, frame, fps_str=str(self.fps))
         try:
           self.image_pub.publish(self.bridge.cv2_to_imgmsg(image, "bgr8"))
         except CvBridgeError as e:
-          print(e)
+          rospy.logerr(e)
 
-  def callback(self, data):
+
+  def info_callback(self,data):
+    if self.first_data_call: 
+      self.first_data_call = False
+      self.cx = float(data.K[2])
+      self.cy = float(data.K[5])
+      self.inv_fx = float(1/data.K[0])
+      self.inv_fy = float(1/data.K[4])
+      a,b = [i.T.flatten() for i in np.meshgrid(range(data.width),range(data.height))]
+      self.index_dict = {i:(a[i],b[i]) for i in range(len(a))} # to overcome the  problem of not having an unravel_dim in torch + it's faster
+      a,b = [i.T.flatten() for i in np.meshgrid(np.arange(-3,4),np.arange(-3,4))]
+      self.center_indexes = [(a[i],b[i]) for i in range(len(a))]
+      self.center_indexes.sort(key = lambda a: np.abs(a[0])+np.abs(a[1]))
+      rospy.loginfo("Done.. camera parameters loaded.")
+
+
+  def callback(self, image_data, depth_data):
+    # rospy.logwarn("Here we are in the callback")
     try:
       if self.use_compressed_image:
-          np_arr = np.fromstring(data.data, np.uint8)
+          np_arr = np.fromstring(image_data.data, np.uint8)
           cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
       else:
-          cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
-
+          cv_image = self.bridge.imgmsg_to_cv2(image_data, "bgr8")
     except CvBridgeError as e:
-      print(e)
+      rospy.logerr(e)
 
-    self.processing_queue.put_nowait((cv_image, data.header))
+    try:      
+      scaling = 1.0
+      if self.use_compressed_image:
+          # TODO: compressed depth is not tested
+          np_arr = np.fromstring(image_data.data, np.uint8)
+          depth_cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+      else:
+          encoding = depth_data.encoding #"16UC1" "32FC1" the other one
+          depth_cv_image = self.bridge.imgmsg_to_cv2(depth_data, encoding)
+          if encoding == "16UC1": 
+            scaling  = 0.001
+      
+    except CvBridgeError as e:
+      rospy.logerr(e)
+
+    self.image_processing_queue.put_nowait((cv_image, image_data.header))
+    self.depth_processing_queue.put_nowait((scaling*depth_cv_image, depth_data.header))
+
 
   def reconfigure_callback(self, config, level):
     if level & (1 << 0): # image_topic / use_compressed_image
         if self.image_sub is not None:
           self.image_sub.unregister()
-
         self.use_compressed_image = config.use_compressed_image
-
         if self.use_compressed_image:
             self.image_topic = config.image_topic + '/compressed'
-            self.image_sub = rospy.Subscriber(self.image_topic, CompressedImage, self.callback, queue_size=1, buff_size=2**24)
+            self.image_sub = message_filters.Subscriber(self.image_topic, CompressedImage)
         else:
             self.image_topic = config.image_topic
-            self.image_sub = rospy.Subscriber(self.image_topic, Image, self.callback, queue_size=1, buff_size=2**24)
-        print('Subscribed to ' + self.image_topic)
+            self.image_sub = message_filters.Subscriber(self.image_topic, Image)
+        rospy.loginfo('Subscribed to ' + self.image_topic)
+
+        if self.depth_sub is not None:
+          self.depth_sub.unregister()
+
+        self.use_compressed_depth = config.use_compressed_depth
+        if self.use_compressed_depth:
+            self.depth_topic = config.depth_topic + '/compressed'
+            self.depth_sub = message_filters.Subscriber(self.depth_topic, CompressedImage)
+        else:
+            self.depth_topic = config.depth_topic
+            self.depth_sub = message_filters.Subscriber(self.depth_topic, Image)
+        rospy.loginfo('Subscribed to ' + self.depth_topic)
+
+        if self.image_sub is not None and self.depth_sub is not None:
+          ts = message_filters.ApproximateTimeSynchronizer([self.image_sub, self.depth_sub],50,10)
+          ts.registerCallback(self.callback)
+    
+    if level & (1 << 12): # camera_info_topic
+      self.camera_info_topic = config.camera_info_topic
+      rospy.Subscriber(self.camera_info_topic, CameraInfo, self.info_callback, queue_size=1, buff_size=2)
+      rospy.loginfo('Subscribed to ' + self.camera_info_topic)
 
     if level & (1 << 1): # publish_visualization
         self.publish_visualization = config.publish_visualization
     if level & (1 << 2): # publish_detections
         self.publish_detections = config.publish_detections
-    if level & (1 << 3): # display_visualization
-        self.display_visualization = config.display_visualization
-        if self.display_visualization:
-            self.unpause_visualization.set()
-            if self.visualization_thread is None: # first time visualization
-                print('Creating thread')
-                self.visualization_thread = threading.Thread(target=self.visualizationLoop)
-                self.visualization_thread.daemon = True
-                self.visualization_thread.start()
-                print('Thread was started')
-        else:
-            self.unpause_visualization.clear()
 
     if level & (1 << 4): # display_masks
         self.display_masks = config.display_masks
@@ -395,7 +703,43 @@ class YolactNode:
     if level & (1 << 11): # top_k
         self.top_k = config.top_k
 
+    if level & (1 << 3): # initial clustering centroid
+        self.initial_centroid = config.initial_centroid
+    
+    # This must be here to define world_frame before it's called down if publish_pointcloud is False in the begenning    
+    if level & (1 << 17): # world frame name
+        self.world_frame = config.world_frame
+
+    if level & (1 << 13): # publish_pointcloud
+        self.publish_pointcloud = config.publish_pointcloud
+        # This may break because world may not be defined yet in the begenning
+        if not self.publish_pointcloud:
+            pcl_points = np.c_[[],[],[]]
+            fields = [PointField('x', 0, PointField.FLOAT32, 1),
+                    PointField('y', 4, PointField.FLOAT32, 1),
+                    PointField('z', 8, PointField.FLOAT32, 1),
+                    ]
+            pc2 = point_cloud2.create_cloud(Header(stamp=rospy.Time.now(),frame_id=self.world_frame), fields, pcl_points)
+            self.pcl_pub.publish(pc2)
+
+    if level & (1 << 14): # publish_bboxes
+        self.publish_bboxes = config.publish_bboxes
+
+    if level & (1 << 15): # cmeans flag
+        self.use_kmeans = config.use_kmeans
+
+    if level & (1 << 16): # world frame flag
+        self.use_bboxes_world_frame = config.use_bboxes_world_frame
+
+    if level & (1 << 18): # gaussian flag
+        self.use_gaussian = config.use_gaussian
+    if level & (1 << 19): # std multiplier for gaussian filter
+        self.std_multiplier = config.std_multiplier
+
     return config
+
+
+
 
 def main(args):
   rospy.init_node('yolact_ros')
