@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import roslib
-roslib.load_manifest('yolact_ros')
+roslib.load_manifest('depth_yolact_ros')
 import sys
 import os
 sys.path.append(os.path.join(os.path.dirname(__file__), "yolact_edge"))
@@ -37,7 +37,7 @@ from collections import defaultdict
 from rospy.numpy_msg import numpy_msg
 
 from dynamic_reconfigure.server import Server as ReconfigureServer
-from yolact_ros.cfg import YolactConfig
+from depth_yolact_ros.cfg import YolactConfig
 
 from utils.tensorrt import convert_to_tensorrt
 
@@ -412,9 +412,9 @@ class YolactInitParams:
 
 
 def main(args):
-  rospy.init_node('yolact_ros')
+  rospy.init_node('depth_yolact_ros')
   rospack = rospkg.RosPack()
-  yolact_path = rospack.get_path('yolact_ros')
+  yolact_path = rospack.get_path('depth_yolact_ros')
 
   params = YolactInitParams()
   

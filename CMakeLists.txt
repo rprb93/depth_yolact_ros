@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 2.8.3)
-project(yolact_ros)
+project(depth_yolact_ros)
 
 ## Compile as C++11, supported in ROS Kinetic and newer
 # add_compile_options(-std=c++11)
@@ -105,7 +105,7 @@ generate_dynamic_reconfigure_options(
 ## DEPENDS: system dependencies of this project that dependent projects also need
 catkin_package(
 #  INCLUDE_DIRS include
-#  LIBRARIES yolact_ros
+#  LIBRARIES depth_yolact_ros
    CATKIN_DEPENDS sensor_msgs cv_bridge rospy std_msgs yolact_ros_msgs dynamic_reconfigure
 #  DEPENDS system_lib
 )
@@ -124,7 +124,7 @@ include_directories(
 
 ## Declare a C++ library
 # add_library(${PROJECT_NAME}
-#   src/${PROJECT_NAME}/yolact_ros.cpp
+#   src/${PROJECT_NAME}/depth_yolact_ros.cpp
 # )
 
 ## Add cmake target dependencies of the library
