@@ -2,6 +2,14 @@
 
 ROS wrapper for Yolact. This repository extends the main one it was forked from by utilizing a depth image to generate 3D bounding boxes and pointclouds of the detected objects.
 
+## Demo
+The following videos shows the package in use. The first video is in a gazebo simulation. The second shows the package working with a D435 camera in realtime.
+
+[![Alt text](https://img.youtube.com/vi/WEpLgTxviIM/0.jpg)](https://www.youtube.com/watch?v=WEpLgTxviIM)
+
+[![Alt text](https://img.youtube.com/vi/7B8EzT0luMM/0.jpg)](https://www.youtube.com/watch?v=7B8EzT0luMM)
+
+
 ## Related packages
 
 [yolact_ros_msgs](https://github.com/Eruvae/yolact_ros_msgs): Provides messages for publishing the detection results.
