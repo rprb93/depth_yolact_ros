@@ -4,3 +4,6 @@
 [submodule "scripts/yolact_edge"]
 	path = scripts/yolact_edge
 	url = https://github.com/Eruvae/yolact_edge.git
+[submodule "yolact_edge"]
+	path = yolact_edge
+	url = https://github.com/Eruvae/yolact_edge.git
