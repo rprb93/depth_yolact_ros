@@ -2,6 +2,12 @@
 
 ROS wrapper for Yolact. This repository extends the main one it was forked from by utilizing a depth image to generate 3D bounding boxes and pointclouds of the detected objects.
 
+## What's Next?
+ - Support yolact_edge 
+ - Support ROS2
+ - Checking the `TODO`s in the code
+ - A complete code refactoring to move the whole depth and pointcloud topics and all their features to a C++ node to utilise the pcl and transformation tools available there and this would make it orders of magnitude faster.
+
 ## Demo
 The following videos shows the package in use. The first video is in a gazebo simulation. The second shows the package working with a D435 camera in realtime.
 
