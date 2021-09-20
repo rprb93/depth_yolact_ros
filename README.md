@@ -13,6 +13,7 @@ The following videos shows the package in use. The first video is in a gazebo si
 ## Related packages
 
 [yolact_ros_msgs](https://github.com/Eruvae/yolact_ros_msgs): Provides messages for publishing the detection results.
+[yolact_ros_tests](https://github.com/MarkNaeem/depth_yolact_test): The test package that was used to make the demo videos.
 
 [yolact_ros_tests](https://github.com/MarkNaeem/depth_yolact_test): The test package that was used to make the demo videos.
 
