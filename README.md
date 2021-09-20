@@ -14,6 +14,8 @@ The following videos shows the package in use. The first video is in a gazebo si
 
 [yolact_ros_msgs](https://github.com/Eruvae/yolact_ros_msgs): Provides messages for publishing the detection results.
 
+[yolact_ros_tests](https://github.com/MarkNaeem/depth_yolact_test): The test package that was used to make the demo videos.
+
 ## Installation
 
 Yolact uses Python 3. If you use a ROS version built with Python 2, additional steps are necessary to run the node.
