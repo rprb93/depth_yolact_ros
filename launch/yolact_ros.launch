@@ -1,22 +1,21 @@
 <?xml version="1.0"?>
 <launch>
-
-  <arg name="yolact_weights" default="$(find depth_yolact_ros)/weights/yolact_plus_resnet50_54_800000.pth" />
-  <arg name="image_topic" default="/camera/color/image_raw" />
-  <arg name="depth_topic" default="/camera/aligend_depth_to_color/image_raw" />
-  <arg name="camera_info_topic" default="/camera/aligend_depth_to_color/camera_info" />
+  <arg name="yolact_weights" default="$(find depth_yolact_ros)/weights/yolact_resnet50_54_800000.pth" />
+  <arg name="image_topic" default="/drone1/camera/color/image_raw" />
+  <arg name="depth_topic" default="/drone1/camera/depth/image_raw" />
+  <arg name="camera_info_topic" default="/drone1/camera/depth/camera_info" />
 
   <arg name="use_compressed_image" default="False" />
   <arg name="use_compressed_depth" default="False" />
   <arg name="publish_visualization" default="True" />
-  <arg name="publish_detections" default="False" />
+  <arg name="publish_detections" default="True" />
   <arg name="publish_pointcloud" default="True" />
   <arg name="publish_bboxes" default="True" />
   <arg name="score_threshold" default="0.25" />		
   <arg name="use_kmeans" default="True" />
   <arg name="initial_centroid" default="7" />
   <arg name="use_bboxes_world_frame" default="True" />
-  <arg name="world_frame" default="odom" />		
+  <arg name="world_frame" default="map" />		
   <arg name="use_gaussian" default="True" />
   <arg name="std_multiplier" value="2.0" />				
 
